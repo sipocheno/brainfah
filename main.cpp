@@ -12,7 +12,7 @@
 constexpr std::size_t TAPE_SIZE{30000};
 
 namespace {
-    enum class Op { Add, Move, Out, In, JumpIfZero, JumpIfNotZero };
+    enum class Op { Add, Move, Out, In, JumpIfZero, JumpIfNotZero, Clear };
 }
 
 namespace {
@@ -71,6 +71,9 @@ static void run(const std::vector<Instr> &commands) {
             case Op::JumpIfNotZero:
                 if (bytes[ptr] != 0) pc = static_cast<std::size_t>(arg);
                 break;
+            case Op::Clear:
+                bytes[ptr] = 0;
+                break;
         }
         ++pc;
     }
@@ -106,6 +109,16 @@ static std::vector<Instr> convert(const std::string_view program) {
         } else if (c == ']') {
             if (stack.empty()) {
                 throw std::runtime_error{"Extra ]"};
+            }
+            if (const std::size_t size = result.size(); size >= 2
+                                                        && result[size - 2].op == Op::JumpIfZero
+                                                        && result[size - 1].op == Op::Add
+                                                        && (result[size - 1].arg == 1 || result[size - 1].arg == -1)) {
+                result.pop_back();
+                result.pop_back();
+                stack.pop_back();
+                result.push_back({.op = Op::Clear, .arg = 0});
+                continue;
             }
             const std::size_t j = stack.back();
             stack.pop_back();
