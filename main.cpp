@@ -11,6 +11,17 @@
 #include <sstream>
 constexpr std::size_t TAPE_SIZE{30000};
 
+namespace {
+    enum class Op { Add, Move, Out, In, JumpIfZero, JumpIfNotZero };
+}
+
+namespace {
+    struct Instr {
+        Op op;
+        int arg;
+    };
+}
+
 static bool use_sample() {
     std::print("Do you want to use sample hello world program for test? (y/n)\n>");
     std::fflush(stdout);
@@ -29,68 +40,83 @@ static std::string read_file(const std::string &path) {
     return buffer.str();
 }
 
-static std::vector<std::size_t> preprocessing(const std::string &program) {
-    const std::size_t length{program.length()};
-    std::vector<std::size_t> stack{};
-    std::vector<std::size_t> jumps(length);
-    for (std::size_t i{0}; i < length; ++i) {
-        if (program[i] == '[') {
-            stack.push_back(i);
-        } else if (program[i] == ']') {
-            if (stack.empty()) {
-                throw std::runtime_error{"Extra ] at position " + std::to_string(i)};
-            }
-            const std::size_t j = stack.back();
-            stack.pop_back();
-            jumps[i] = j;
-            jumps[j] = i;
-        }
-    }
-    if (!stack.empty()) {
-        throw std::runtime_error{"Unclosed [ at position " + std::to_string(stack.back())};
-    }
-    return jumps;
-}
-
-static void run(const std::string &program, const std::vector<std::size_t> &jump_table) {
+static void run(const std::vector<Instr> &commands) {
     std::array<unsigned char, TAPE_SIZE> bytes{};
-    std::size_t ptr{};
     std::size_t pc{};
-    while (pc < program.length()) {
-        switch (program[pc]) {
-            case '>':
-                ptr = (ptr + 1 == TAPE_SIZE) ? 0 : ptr + 1;
+    std::size_t ptr{};
+    while (pc < commands.size()) {
+        switch (const auto [op, arg] = commands[pc]; op) {
+            case Op::Add:
+                bytes[ptr] = static_cast<unsigned char>(bytes[ptr] + arg);
                 break;
-            case '<':
-                ptr = (ptr == 0) ? TAPE_SIZE - 1 : ptr - 1;
+            case Op::Move: {
+                ptr = static_cast<std::size_t>(static_cast<std::ptrdiff_t>(ptr) + arg);
+                if (ptr >= TAPE_SIZE) {
+                    throw std::runtime_error{"Pointer out of bounds"};
+                }
                 break;
-            case '+':
-                ++bytes[ptr];
-                break;
-            case '-':
-                --bytes[ptr];
-                break;
-            case '.':
+            }
+            case Op::Out:
                 std::putchar(bytes[ptr]);
                 break;
-            case ',': {
+            case Op::In: {
                 std::fflush(stdout);
                 const int c = std::cin.get();
                 bytes[ptr] = (c == EOF) ? 0 : static_cast<unsigned char>(c);
                 break;
             }
-            case '[':
-                if (bytes[ptr] == 0) pc = jump_table[pc];
+            case Op::JumpIfZero:
+                if (bytes[ptr] == 0) pc = static_cast<std::size_t>(arg);
                 break;
-            case ']':
-                if (bytes[ptr] != 0) pc = jump_table[pc];
-                break;
-            default:
+            case Op::JumpIfNotZero:
+                if (bytes[ptr] != 0) pc = static_cast<std::size_t>(arg);
                 break;
         }
         ++pc;
     }
     std::fflush(stdout);
+}
+
+static std::vector<Instr> convert(const std::string_view program) {
+    std::vector<Instr> result{};
+    std::vector<std::size_t> stack{};
+    result.reserve(program.size());
+    for (const char c: program) {
+        if (c == '+' || c == '-') {
+            const int d = (c == '+') ? 1 : -1;
+            if (!result.empty() && result.back().op == Op::Add) {
+                result.back().arg += d;
+            } else {
+                result.push_back({.op = Op::Add, .arg = d});
+            }
+        } else if (c == '>' || c == '<') {
+            const int d = (c == '>') ? 1 : -1;
+            if (!result.empty() && result.back().op == Op::Move) {
+                result.back().arg += d;
+            } else {
+                result.push_back({.op = Op::Move, .arg = d});
+            }
+        } else if (c == '.') {
+            result.push_back({.op = Op::Out, .arg = 0});
+        } else if (c == ',') {
+            result.push_back({.op = Op::In, .arg = 0});
+        } else if (c == '[') {
+            stack.push_back(result.size());
+            result.push_back({.op = Op::JumpIfZero, .arg = 0});
+        } else if (c == ']') {
+            if (stack.empty()) {
+                throw std::runtime_error{"Extra ]"};
+            }
+            const std::size_t j = stack.back();
+            stack.pop_back();
+            result.push_back({.op = Op::JumpIfNotZero, .arg = static_cast<int>(j)});
+            result[j].arg = static_cast<int>(result.size() - 1);
+        }
+    }
+    if (!stack.empty()) {
+        throw std::runtime_error{"Unclosed ["};
+    }
+    return result;
 }
 
 int main(const int argc, char **argv) {
@@ -107,8 +133,8 @@ int main(const int argc, char **argv) {
                 std::getline(std::cin, program);
             }
         }
-        const auto jump_table = preprocessing(program);
-        run(program, jump_table);
+        const auto vec = convert(program);
+        run(vec);
     } catch (const std::exception &e) {
         std::println(stderr, "Error: {}", e.what());
         return 1;
