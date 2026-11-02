@@ -1,11 +1,11 @@
-// Run:    ./brainfah tests/mandelbrot.bf
-//         ./brainfah --emit-c tests/mandelbrot.bf
-//         ./brainfah --no-cache tests/mandelbrot.bf
-
 #include <algorithm>
+#include <chrono>
+#include <fcntl.h>
+#include <sys/wait.h>
 #include <csignal>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <exception>
 #include <filesystem>
@@ -69,11 +69,12 @@ namespace {
     }
 
     constexpr int inverse256(const int a) noexcept {
-        int x = a;
-        x *= 2 - a * x;
-        x *= 2 - a * x;
-        x *= 2 - a * x;
-        return x & 0xFF;
+        const auto ua = static_cast<unsigned>(a);
+        unsigned x = ua;
+        x *= 2U - ua * x;
+        x *= 2U - ua * x;
+        x *= 2U - ua * x;
+        return static_cast<int>(x & 0xFFU);
     }
 
     struct CellEffect {
@@ -699,6 +700,96 @@ static ProgramIr convert(const std::string_view program) {
 // ---------------------------------------------------------------------------
 // Backend: Multi-level SSA Register Promotion + Apple Silicon NEON C Codegen
 // ---------------------------------------------------------------------------
+// Tunable code-generation / compiler-flag knobs; `--tune` picks the fastest combination for a given program.
+struct Config {
+    int scan{1}; // 0 = scalar scans, 1 = NEON for stride +-1 only, 2 = NEON for all strides (measured slower)
+    int flagset{0}; // extra clang flags, see config_flags()
+    int promote{28}; // max cells held in registers for one promoted loop
+    int branchless{0}; // 0 = off, 1 = if-convert `if (cell)` bodies up to 4 ops, 2 = up to 12 ops
+};
+
+static Config g_cfg;
+
+static std::string config_tag(const Config &c) {
+    return std::format("s{}f{}p{}b{}", c.scan, c.flagset, c.promote, c.branchless);
+}
+
+static std::string config_flags(const int flagset) {
+    switch (flagset) {
+        case 1: return "-fno-slp-vectorize -fno-vectorize";
+        case 2: return "-fno-unroll-loops";
+        case 3: return "-fno-slp-vectorize -fno-vectorize -fno-unroll-loops";
+        case 4: return "-O2";
+        default: return "";
+    }
+}
+
+static std::string replace_all(std::string s, const std::string_view from, const std::string &to) {
+    for (std::size_t pos = 0; (pos = s.find(from, pos)) != std::string::npos; pos += to.size()) {
+        s.replace(pos, from.size(), to);
+    }
+    return s;
+}
+
+// Emits NEON scan helpers for strides 3..16 (except 4) that actually occur in the program.
+static void emit_generic_scans(std::string &out, const std::vector<Ir> &ir) {
+    static constexpr std::string_view TEMPLATE = R"BF(#ifdef __ARM_NEON
+static const uint64_t bf_pat_@S@[@S@] = {@T@};
+static inline __attribute__((always_inline)) u8* scan_right_@S@(u8 *p) {
+    BF_PRE_R(@S@)
+    if (*p == 0) return p;
+    const unsigned mis = (unsigned)((uintptr_t)p & 15);
+    u8 *b = p - mis;
+    unsigned ph = mis % @S@u;
+    uint64_t m = neon_zero_mask(vld1q_u8(b)) & bf_pat_@S@[ph] & (~0ULL << (4 * mis));
+    for (;;) {
+        if (m) return b + (__builtin_ctzll(m) >> 2);
+        b += 16;
+        ph = ph >= @R@u ? ph - @R@u : ph + @S@u - @R@u;
+        m = neon_zero_mask(vld1q_u8(b)) & bf_pat_@S@[ph];
+    }
+}
+static inline __attribute__((always_inline)) u8* scan_left_@S@(u8 *p) {
+    BF_PRE_L(@S@)
+    if (*p == 0) return p;
+    const unsigned mis = (unsigned)((uintptr_t)p & 15);
+    u8 *b = p - mis;
+    unsigned ph = mis % @S@u;
+    uint64_t m = neon_zero_mask(vld1q_u8(b)) & bf_pat_@S@[ph] & (~0ULL >> (60 - 4 * mis));
+    for (;;) {
+        if (m) return b + 15 - (__builtin_clzll(m) >> 2);
+        b -= 16;
+        ph += @R@u;
+        if (ph >= @S@u) ph -= @S@u;
+        m = neon_zero_mask(vld1q_u8(b)) & bf_pat_@S@[ph];
+    }
+}
+#else
+static inline u8* scan_right_@S@(u8 *p) { while (*p) p += @S@; return p; }
+static inline u8* scan_left_@S@(u8 *p) { while (*p) p -= @S@; return p; }
+#endif
+)BF";
+
+    std::set<int> strides;
+    for (const Ir &in: ir) {
+        if (in.op != Op::Scan) continue;
+        if (const int a = std::abs(in.arg); a >= 3 && a <= 16 && a != 4) strides.insert(a);
+    }
+    for (const int s: strides) {
+        std::string tbl;
+        for (int ph = 0; ph < s; ++ph) {
+            std::uint64_t pat = 0;
+            for (int lane = ph; lane < 16; lane += s) pat |= 0xFULL << (4 * lane);
+            tbl += std::format("0x{:016x}ULL,", pat);
+        }
+        std::string t = replace_all(std::string{TEMPLATE}, "@S@", std::to_string(s));
+        t = replace_all(std::move(t), "@R@", std::to_string(16 % s));
+        t = replace_all(std::move(t), "@T@", tbl);
+        out += t;
+        out += '\n';
+    }
+}
+
 static std::string generate_c(const ProgramIr &prog) {
     const auto &ir = prog.code;
     std::string out;
@@ -712,7 +803,9 @@ static std::string generate_c(const ProgramIr &prog) {
             "#ifdef __ARM_NEON\n"
             "#include <arm_neon.h>\n"
             "#endif\n\n"
-            "typedef uint8_t u8;\n\n"
+            "typedef uint8_t u8;\n"
+            "#define BF_PRE_R(N) if (*p == 0) return p; p += (N); if (*p == 0) return p; p += (N); if (*p == 0) return p; p += (N);\n"
+            "#define BF_PRE_L(N) if (*p == 0) return p; p -= (N); if (*p == 0) return p; p -= (N); if (*p == 0) return p; p -= (N);\n\n"
             "#ifdef __ARM_NEON\n"
             "static inline __attribute__((always_inline)) uint64_t neon_zero_mask(uint8x16_t v) {\n"
             "    uint8x16_t cmp = vceqq_u8(v, vdupq_n_u8(0));\n"
@@ -746,17 +839,96 @@ static std::string generate_c(const ProgramIr &prog) {
             "        if (mask != 0) return p + 15 - (__builtin_clzll(mask) >> 2);\n"
             "    }\n"
             "}\n"
+            "static inline __attribute__((always_inline)) u8* scan_right_2(u8 *p) {\n"
+            "    BF_PRE_R(2)\n"
+            "    if (*p == 0) return p;\n"
+            "    while (((uintptr_t)p & 30) != 0) { p += 2; if (*p == 0) return p; }\n"
+            "    const unsigned par = (unsigned)((uintptr_t)p & 1);\n"
+            "    p -= par;\n"
+            "    for (;;) {\n"
+            "        uint8x16x2_t v = vld2q_u8(p);\n"
+            "        uint8x16_t l = v.val[0];\n"
+            "        if (par) l = v.val[1];\n"
+            "        uint64_t m = neon_zero_mask(l);\n"
+            "        if (m) return p + par + ((unsigned)__builtin_ctzll(m) >> 2) * 2;\n"
+            "        p += 32;\n"
+            "    }\n"
+            "}\n\n"
+            "static inline __attribute__((always_inline)) u8* scan_left_2(u8 *p) {\n"
+            "    BF_PRE_L(2)\n"
+            "    for (;;) {\n"
+            "        if (*p == 0) return p;\n"
+            "        if (((uintptr_t)p & 31) < 2) break;\n"
+            "        p -= 2;\n"
+            "    }\n"
+            "    const unsigned par = (unsigned)((uintptr_t)p & 1);\n"
+            "    u8 *b = p - par - 32;\n"
+            "    for (;;) {\n"
+            "        uint8x16x2_t v = vld2q_u8(b);\n"
+            "        uint8x16_t l = v.val[0];\n"
+            "        if (par) l = v.val[1];\n"
+            "        uint64_t m = neon_zero_mask(l);\n"
+            "        if (m) return b + par + (15 - ((unsigned)__builtin_clzll(m) >> 2)) * 2;\n"
+            "        b -= 32;\n"
+            "    }\n"
+            "}\n\n"
+            "static inline __attribute__((always_inline)) u8* scan_right_4(u8 *p) {\n"
+            "    BF_PRE_R(4)\n"
+            "    if (*p == 0) return p;\n"
+            "    while (((uintptr_t)p & 60) != 0) { p += 4; if (*p == 0) return p; }\n"
+            "    const unsigned par = (unsigned)((uintptr_t)p & 3);\n"
+            "    p -= par;\n"
+            "    for (;;) {\n"
+            "        uint8x16x4_t v = vld4q_u8(p);\n"
+            "        uint8x16_t l = v.val[0];\n"
+            "        if (par == 1) l = v.val[1];\n"
+            "        else if (par == 2) l = v.val[2];\n"
+            "        else if (par == 3) l = v.val[3];\n"
+            "        uint64_t m = neon_zero_mask(l);\n"
+            "        if (m) return p + par + ((unsigned)__builtin_ctzll(m) >> 2) * 4;\n"
+            "        p += 64;\n"
+            "    }\n"
+            "}\n\n"
+            "static inline __attribute__((always_inline)) u8* scan_left_4(u8 *p) {\n"
+            "    BF_PRE_L(4)\n"
+            "    for (;;) {\n"
+            "        if (*p == 0) return p;\n"
+            "        if (((uintptr_t)p & 63) < 4) break;\n"
+            "        p -= 4;\n"
+            "    }\n"
+            "    const unsigned par = (unsigned)((uintptr_t)p & 3);\n"
+            "    u8 *b = p - par - 64;\n"
+            "    for (;;) {\n"
+            "        uint8x16x4_t v = vld4q_u8(b);\n"
+            "        uint8x16_t l = v.val[0];\n"
+            "        if (par == 1) l = v.val[1];\n"
+            "        else if (par == 2) l = v.val[2];\n"
+            "        else if (par == 3) l = v.val[3];\n"
+            "        uint64_t m = neon_zero_mask(l);\n"
+            "        if (m) return b + par + (15 - ((unsigned)__builtin_clzll(m) >> 2)) * 4;\n"
+            "        b -= 64;\n"
+            "    }\n"
+            "}\n"
             "#else\n"
-            "static inline u8* scan_right_1(u8 *p) { return (u8 *)memchr(p, 0, (size_t)-1); }\n"
+            "static inline u8* scan_right_1(u8 *p) { while (*p) ++p; return p; }\n"
             "static inline u8* scan_left_1(u8 *p) { while (*p) --p; return p; }\n"
-            "#endif\n\n"
-            "__attribute__((noinline)) static size_t bf_flush(u8 *out_buf, size_t pos) {\n"
-            "    if (pos > 0) (void)write(STDOUT_FILENO, out_buf, pos);\n"
+            "static inline u8* scan_right_2(u8 *p) { while (*p) p += 2; return p; }\n"
+            "static inline u8* scan_left_2(u8 *p) { while (*p) p -= 2; return p; }\n"
+            "static inline u8* scan_right_4(u8 *p) { while (*p) p += 4; return p; }\n"
+            "static inline u8* scan_left_4(u8 *p) { while (*p) p -= 4; return p; }\n"
+            "#endif\n\n";
+    if (g_cfg.scan == 2) emit_generic_scans(out, ir);
+    out +=
+            "static u8 out_buf[65536];\n"
+            "static size_t out_pos;\n"
+            "static int bf_lb;\n\n"
+            "__attribute__((noinline)) static size_t bf_flush(u8 *buf, size_t pos) {\n"
+            "    if (pos > 0) (void)write(STDOUT_FILENO, buf, pos);\n"
             "    return 0;\n"
             "}\n\n"
             "static inline __attribute__((always_inline)) void bf_out(u8 c, u8 *out_buf, size_t *out_pos) {\n"
             "    out_buf[(*out_pos)++] = c;\n"
-            "    if (__builtin_expect(*out_pos == 65536 || c == 10, 0)) {\n"
+            "    if (__builtin_expect(*out_pos == 65536 || (c == 10 && bf_lb), 0)) {\n"
             "        *out_pos = bf_flush(out_buf, *out_pos);\n"
             "    }\n"
             "}\n\n"
@@ -765,10 +937,14 @@ static std::string generate_c(const ProgramIr &prog) {
             "    int c = getchar_unlocked();\n"
             "    return (u8)(c == EOF ? 0 : c);\n"
             "}\n\n"
+            "#ifdef BF_PGO\n"
+            "extern int __llvm_profile_write_file(void);\n"
+            "void bf_pgo_dump(void) { (void)__llvm_profile_write_file(); }\n"
+            "#endif\n\n"
+            "void bf_flush_out(void) { out_pos = bf_flush(out_buf, out_pos); }\n\n"
             "void bf_run(u8 * __restrict base) {\n"
             "    u8 * __restrict p = base;\n"
-            "    u8 out_buf[65536];\n"
-            "    size_t out_pos = 0;\n";
+            "    bf_lb = isatty(STDOUT_FILENO);\n";
 
     int depth = 1;
     const auto line = [&](const std::string_view s) {
@@ -790,6 +966,75 @@ static std::string generate_c(const ProgramIr &prog) {
         return (off >= 0) ? std::format("r_p{}", off) : std::format("r_m{}", -off);
     };
 
+    // If-conversion of `if (cell) { straight-line Add/Set/MulAdd }`: run the body on temporaries and select with csel,
+    // so unpredictable data-dependent conditions cost no branch mispredict. Returns the EndIf index, or 0 if not applied.
+    const auto try_branchless = [&](const std::size_t open, const bool regs) -> std::size_t {
+        if (g_cfg.branchless == 0) return 0;
+        const auto end_idx = static_cast<std::size_t>(ir[open].arg);
+        const std::size_t max_ops = g_cfg.branchless == 1 ? 4 : 12;
+        if (end_idx <= open + 1 || end_idx - open - 1 > max_ops) return 0;
+
+        std::set<int> cells;
+        std::set<int> written;
+        cells.insert(ir[open].off);
+        for (std::size_t k = open + 1; k < end_idx; ++k) {
+            const Ir &b = ir[k];
+            switch (b.op) {
+                case Op::Add:
+                case Op::Set:
+                    cells.insert(b.off);
+                    written.insert(b.off);
+                    break;
+                case Op::MulAdd:
+                case Op::MulAddClear:
+                    cells.insert(b.off);
+                    cells.insert(b.off2);
+                    written.insert(b.off2);
+                    if (b.op == Op::MulAddClear) written.insert(b.off);
+                    break;
+                default:
+                    return 0;
+            }
+        }
+
+        const auto ref = [&](const int off) -> std::string {
+            return regs ? make_reg(off) : std::format("p[{}]", off);
+        };
+        const auto tmp = [](const int off) -> std::string {
+            return off >= 0 ? std::format("t_p{}", off) : std::format("t_m{}", -off);
+        };
+
+        line("{");
+        ++depth;
+        line(std::format("const int cnd = {} != 0;", ref(ir[open].off)));
+        for (const int off: cells) line(std::format("u8 {} = {};", tmp(off), ref(off)));
+        for (std::size_t k = open + 1; k < end_idx; ++k) {
+            const Ir &b = ir[k];
+            switch (b.op) {
+                case Op::Add:
+                    line(std::format("{} += {}u;", tmp(b.off), mod256(b.arg)));
+                    break;
+                case Op::Set:
+                    line(std::format("{} = {}u;", tmp(b.off), mod256(b.arg)));
+                    break;
+                default:
+                    if (b.arg == 1) {
+                        line(std::format("{} += {};", tmp(b.off2), tmp(b.off)));
+                    } else if (b.arg == 255) {
+                        line(std::format("{} -= {};", tmp(b.off2), tmp(b.off)));
+                    } else {
+                        line(std::format("{} += (u8)({}u * {});", tmp(b.off2), b.arg, tmp(b.off)));
+                    }
+                    if (b.op == Op::MulAddClear) line(std::format("{} = 0;", tmp(b.off)));
+                    break;
+            }
+        }
+        for (const int off: written) line(std::format("{} = cnd ? {} : {};", ref(off), tmp(off), ref(off)));
+        --depth;
+        line("}");
+        return end_idx;
+    };
+
     for (std::size_t i = 0; i < ir.size(); ++i) {
         const Ir &in = ir[i];
         switch (in.op) {
@@ -809,6 +1054,10 @@ static std::string generate_c(const ProgramIr &prog) {
                 line(std::format("p[{}] = bf_get(out_buf, &out_pos);", in.off));
                 break;
             case Op::IfNonZero:
+                if (const std::size_t e = try_branchless(i, false); e != 0) {
+                    i = e;
+                    break;
+                }
                 line(std::format("if (p[{}]) {{", in.off));
                 ++depth;
                 break;
@@ -858,7 +1107,7 @@ static std::string generate_c(const ProgramIr &prog) {
                 std::set<int> all_cells = read_cells;
                 all_cells.insert(written_cells.begin(), written_cells.end());
 
-                if (can_promote && all_cells.size() <= 28) {
+                if (can_promote && all_cells.size() <= static_cast<std::size_t>(g_cfg.promote)) {
                     line("{");
                     ++depth;
                     for (const int off: all_cells) {
@@ -906,6 +1155,10 @@ static std::string generate_c(const ProgramIr &prog) {
                                 line("}");
                                 break;
                             case Op::IfNonZero:
+                                if (const std::size_t e = try_branchless(k, true); e != 0) {
+                                    k = e;
+                                    break;
+                                }
                                 line(std::format("if ({}) {{", make_reg(body.off)));
                                 ++depth;
                                 break;
@@ -964,10 +1217,24 @@ static std::string generate_c(const ProgramIr &prog) {
                 line(std::format("p[{}] = 0;", in.off));
                 break;
             case Op::Scan:
+                if (g_cfg.scan == 0 || (g_cfg.scan == 1 && std::abs(in.arg) != 1)) {
+                    line(std::format("while (*p) p += {};", in.arg));
+                    break;
+                }
                 if (in.arg == 1) {
                     line("p = scan_right_1(p);");
                 } else if (in.arg == -1) {
                     line("p = scan_left_1(p);");
+                } else if (in.arg == 2) {
+                    line("p = scan_right_2(p);");
+                } else if (in.arg == -2) {
+                    line("p = scan_left_2(p);");
+                } else if (in.arg == 4) {
+                    line("p = scan_right_4(p);");
+                } else if (in.arg == -4) {
+                    line("p = scan_left_4(p);");
+                } else if (std::abs(in.arg) >= 3 && std::abs(in.arg) <= 16) {
+                    line(std::format("p = scan_{}_{}(p);", in.arg > 0 ? "right" : "left", std::abs(in.arg)));
                 } else {
                     line(std::format("while (*p) p += {};", in.arg));
                 }
@@ -1003,12 +1270,46 @@ static std::string shell_quote(const std::string_view s) {
     return res;
 }
 
-static std::string build_library(const std::string &c_source, const bool no_cache) {
-    namespace fs = std::filesystem;
+namespace fs = std::filesystem;
+
+static fs::path resolve_cc(const std::string &cc) {
+    const std::string exe = cc.substr(0, cc.find(' '));
+    fs::path found;
+    if (exe.find('/') != std::string::npos) {
+        found = exe;
+    } else if (const char *path_env = std::getenv("PATH")) {
+        const std::string_view paths{path_env};
+        for (std::size_t start = 0; start <= paths.size();) {
+            std::size_t end = paths.find(':', start);
+            if (end == std::string_view::npos) end = paths.size();
+            const fs::path cand = fs::path{std::string{paths.substr(start, end - start)}} / exe;
+            if (::access(cand.c_str(), X_OK) == 0) {
+                found = cand;
+                break;
+            }
+            start = end + 1;
+        }
+    }
+    if (found.empty()) return {};
+    std::error_code ec;
+    const fs::path real = fs::canonical(found, ec);
+    return ec ? fs::path{} : real;
+}
+
+struct Toolchain {
+    std::string cc;
+    std::string flags;
+    fs::path dir;
+    const char *ext;
+    std::string cc_id; // resolved compiler path, so switching toolchains invalidates the cache
+};
+
+static Toolchain get_toolchain() {
 #ifdef __APPLE__
     const char *ext = ".dylib";
     const char *default_flags =
-            "-O3 -mcpu=native -fomit-frame-pointer -fno-stack-protector -fstrict-aliasing -fvectorize -fslp-vectorize";
+            "-O3 -mcpu=native -fomit-frame-pointer -fno-stack-protector -fstrict-aliasing -fvectorize -fslp-vectorize "
+            "-fno-unwind-tables -fno-asynchronous-unwind-tables";
 #else
     const char *ext = ".so";
     const char *default_flags = "-O3 -march=native -fomit-frame-pointer -fno-stack-protector -fstrict-aliasing";
@@ -1018,25 +1319,44 @@ static std::string build_library(const std::string &c_source, const bool no_cach
     const char *dir_env = std::getenv("BF_CACHE_DIR");
 
     const std::string cc = cc_env ? cc_env : "clang";
-    const std::string flags = std::string{flags_env ? flags_env : default_flags} + " -fno-finite-loops";
+    const fs::path cc_real = resolve_cc(cc);
+    Toolchain t{
+        .cc = cc,
+        .flags = std::string{flags_env ? flags_env : default_flags} + " -fno-finite-loops",
+        .dir = dir_env ? fs::path{dir_env} : fs::temp_directory_path() / "bf_native_cache",
+        .ext = ext,
+        .cc_id = cc_real.empty() ? cc : cc_real.string()
+    };
+    fs::create_directories(t.dir);
+    return t;
+}
 
-    const fs::path dir = dir_env ? fs::path{dir_env} : fs::temp_directory_path() / "bf_native_cache";
-    fs::create_directories(dir);
-
-    const std::string key = std::format("{:016x}", fnv1a(c_source + '\n' + cc + '\n' + flags));
-    const fs::path lib = dir / ("bf_" + key + ext);
+static std::string build_library(const std::string &program, const bool no_cache,
+                                 const std::string &extra = {}, const std::string &tag = {}) {
+    const Toolchain tc = get_toolchain();
+    const std::string all_extra = extra + " " + config_flags(g_cfg.flagset);
+    const std::string key = std::format(
+        "{:016x}", fnv1a(program + '\n' + tc.cc_id + '\n' + tc.flags + '\n' + all_extra + '\n' + tag + '\n' +
+                         config_tag(g_cfg) + "\ncodegen-v6"));
+    const fs::path lib = tc.dir / ("bf_" + key + tc.ext);
 
     if (no_cache || !fs::exists(lib)) {
-        const fs::path tmp = dir / std::format("bf_{}_{}.tmp{}", key, ::getpid(), ext);
-        const std::string cmd = cc + " " + flags + " -fPIC -shared -w -x c - -o " + shell_quote(tmp.string());
+        const fs::path tmp = tc.dir / std::format("bf_{}_{}.tmp{}", key, ::getpid(), tc.ext);
+        const fs::path src = tc.dir / std::format("bf_{}_{}.c", key, ::getpid());
+        {
+            const std::string c_source = generate_c(convert(program));
+            std::ofstream f{src, std::ios::binary | std::ios::trunc};
+            f.write(c_source.data(), static_cast<std::streamsize>(c_source.size()));
+            f.flush();
+            if (!f) throw std::runtime_error{"Failed to write temporary C source"};
+        }
+        const std::string cmd = tc.cc + " " + tc.flags + " " + all_extra + " -fPIC -shared -w -x c " +
+                                shell_quote(src.string()) + " -o " + shell_quote(tmp.string());
+        const int rc = std::system(cmd.c_str());
 
-        FILE *pipe = ::popen(cmd.c_str(), "w");
-        if (!pipe) throw std::runtime_error{"popen failed"};
-        const std::size_t written = std::fwrite(c_source.data(), 1, c_source.size(), pipe);
-        const int rc = ::pclose(pipe);
-
-        if (written != c_source.size() || rc != 0) {
-            std::error_code ec;
+        std::error_code ec;
+        fs::remove(src, ec);
+        if (rc != 0) {
             fs::remove(tmp, ec);
             throw std::runtime_error{"Compilation failed (command: " + cmd + ")"};
         }
@@ -1051,6 +1371,10 @@ struct LibraryHandle {
     void *handle{nullptr};
     RunFn fn{nullptr};
 
+    void (*flush)(){nullptr};
+
+    void (*dump)(){nullptr};
+
     explicit LibraryHandle(const std::string &path) {
         handle = ::dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
         if (!handle) throw std::runtime_error{std::string{"dlopen failed: "} + ::dlerror()};
@@ -1060,11 +1384,12 @@ struct LibraryHandle {
             throw std::runtime_error{"bf_run symbol not found"};
         }
         fn = reinterpret_cast<RunFn>(sym);
+        flush = reinterpret_cast<void (*)()>(::dlsym(handle, "bf_flush_out"));
+        dump = reinterpret_cast<void (*)()>(::dlsym(handle, "bf_pgo_dump"));
     }
 
-    ~LibraryHandle() {
-        if (handle) ::dlclose(handle);
-    }
+    // Intentionally no dlclose: the process exits right after the run.
+    ~LibraryHandle() = default;
 
     LibraryHandle(const LibraryHandle &) = delete;
 
@@ -1099,13 +1424,13 @@ static bool call_guarded(const RunFn fn, unsigned char *base) {
     return ok;
 }
 
-static void run_native(const RunFn fn) {
+static void run_native(const LibraryHandle &lib) {
     const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
     const std::size_t tape_bytes = (TAPE_SIZE + page - 1) / page * page;
     const std::size_t guard = (GUARD_SIZE + page - 1) / page * page;
     const std::size_t total = guard * 2 + tape_bytes;
 
-    void *region = ::mmap(nullptr, total, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    void *region = ::mmap(nullptr, total, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
     if (region == MAP_FAILED) throw std::runtime_error{"mmap failed"};
 
     auto *tape_start = static_cast<unsigned char *>(region) + guard;
@@ -1115,9 +1440,159 @@ static void run_native(const RunFn fn) {
     }
 
     unsigned char *base = tape_start + TAPE_OFFSET;
-    const bool ok = call_guarded(fn, base);
-    ::munmap(region, total);
-    if (!ok) throw std::runtime_error{"Pointer out of bounds"};
+    if (!call_guarded(lib.fn, base)) {
+        if (lib.flush) lib.flush();
+        ::munmap(region, total);
+        throw std::runtime_error{"Pointer out of bounds"};
+    }
+}
+
+// llvm-profdata must match the compiler's raw profile version, so prefer the one sitting next to the compiler.
+static std::string find_profdata(const std::string &cc) {
+    if (const char *e = std::getenv("BF_PROFDATA")) return e;
+    if (const fs::path real = resolve_cc(cc); !real.empty()) {
+        if (const fs::path sib = real.parent_path() / "llvm-profdata"; ::access(sib.c_str(), X_OK) == 0) {
+            return shell_quote(sib.string());
+        }
+    }
+    return "xcrun llvm-profdata";
+}
+
+// Profile-guided build: first run trains (instrumented, runs the program for real), later runs use the profile.
+static void run_pgo(const std::string &program, const bool no_cache) {
+    const Toolchain tc = get_toolchain();
+    const std::string base = std::format(
+        "{:016x}", fnv1a(program + '\n' + tc.cc_id + '\n' + tc.flags + '\n' + config_tag(g_cfg) + "\npgo-v2"));
+    const fs::path prof = tc.dir / ("bf_" + base + ".profdata");
+    const std::string use_flags = "-fprofile-use=" + shell_quote(prof.string());
+
+    if (no_cache || !fs::exists(prof)) {
+        const fs::path raw = tc.dir / std::format("bf_{}_{}.profraw", base, ::getpid());
+        ::setenv("LLVM_PROFILE_FILE", raw.c_str(), 1);
+        {
+            const LibraryHandle lib{build_library(program, true, "-fprofile-instr-generate -DBF_PGO", "pgo-gen")};
+            run_native(lib);
+            if (lib.dump) lib.dump();
+        }
+        const fs::path tmp = tc.dir / std::format("bf_{}_{}.tmp.profdata", base, ::getpid());
+        const std::string cmd = find_profdata(tc.cc) + " merge -output=" +
+                                shell_quote(tmp.string()) + " " + shell_quote(raw.string());
+        const int rc = std::system(cmd.c_str());
+        std::error_code ec;
+        fs::remove(raw, ec);
+        if (rc != 0) {
+            fs::remove(tmp, ec);
+            throw std::runtime_error{"llvm-profdata merge failed (set BF_PROFDATA to its path)"};
+        }
+        fs::rename(tmp, prof);
+        (void) build_library(program, true, use_flags, "pgo-use"); // warm the cache for the next run
+        return;
+    }
+    const LibraryHandle lib{build_library(program, no_cache, use_flags, "pgo-use")};
+    run_native(lib);
+}
+
+// ---------------------------------------------------------------------------
+// Autotuner: builds a handful of variants, times them on the real program (stdin/stdout -> /dev/null)
+// and stores the fastest combination. Only for programs that don't read input.
+// ---------------------------------------------------------------------------
+static fs::path tune_file(const std::string &program, const Toolchain &tc) {
+    const std::string key = std::format("{:016x}", fnv1a(program + '\n' + tc.cc_id + '\n' + tc.flags + "\ntune-v1"));
+    return tc.dir / ("bf_" + key + ".tune");
+}
+
+static void load_tuned(const std::string &program) {
+    const Toolchain tc = get_toolchain();
+    std::ifstream f{tune_file(program, tc)};
+    Config c;
+    if (f >> c.scan >> c.flagset >> c.promote >> c.branchless && c.branchless >= 0 && c.branchless <= 2 && c.scan >= 0
+        && c.scan <= 2 && c.flagset >= 0 && c.flagset <= 4 &&
+        c.promote >= 4 && c.promote <= 128) {
+        g_cfg = c;
+    }
+}
+
+static double time_variant(const std::string &program, const Config &cfg, const int reps) {
+    g_cfg = cfg;
+    std::string path;
+    try {
+        path = build_library(program, false);
+    } catch (const std::exception &) {
+        return 1e30;
+    }
+    double best = 1e30;
+    for (int r = 0; r < reps; ++r) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const pid_t pid = ::fork();
+        if (pid < 0) return 1e30;
+        if (pid == 0) {
+            const int dn = ::open("/dev/null", O_RDWR);
+            if (dn >= 0) {
+                ::dup2(dn, 0);
+                ::dup2(dn, 1);
+                ::dup2(dn, 2);
+            }
+            ::alarm(300);
+            try {
+                const LibraryHandle lib{path};
+                run_native(lib);
+            } catch (...) {
+                ::_exit(1);
+            }
+            ::_exit(0);
+        }
+        int st = 0;
+        ::waitpid(pid, &st, 0);
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) return 1e30;
+        best = std::min(best, dt);
+    }
+    return best;
+}
+
+static void run_tune(const std::string &program) {
+    if (program.find(',') != std::string::npos) {
+        throw std::runtime_error{"--tune needs a program without input (',')"};
+    }
+    Config best;
+    double best_t = time_variant(program, best, 3);
+    if (best_t > 1e29) throw std::runtime_error{"baseline variant failed to build or run"};
+    std::println(stderr, "baseline {:<12} {:.3f}s", config_tag(best), best_t);
+
+    const auto try_cfg = [&](const Config &cand) {
+        const double t = time_variant(program, cand, 3);
+        std::println(stderr, "         {:<12} {:.3f}s", config_tag(cand), t);
+        if (t < best_t * 0.98) {
+            best_t = t;
+            best = cand;
+        }
+    };
+    for (const int v: {1, 0}) {
+        Config cand = best;
+        cand.scan = v;
+        try_cfg(cand);
+    }
+    for (int v = 1; v <= 4; ++v) {
+        Config cand = best;
+        cand.flagset = v;
+        try_cfg(cand);
+    }
+    for (const int v: {1, 2}) {
+        Config cand = best;
+        cand.branchless = v;
+        try_cfg(cand);
+    }
+    for (const int v: {12, 20, 40, 64}) {
+        Config cand = best;
+        cand.promote = v;
+        try_cfg(cand);
+    }
+
+    const Toolchain tc = get_toolchain();
+    std::ofstream out{tune_file(program, tc), std::ios::trunc};
+    out << best.scan << ' ' << best.flagset << ' ' << best.promote << ' ' << best.branchless << '\n';
+    g_cfg = best;
+    std::println(stderr, "selected {} ({:.3f}s)", config_tag(best), best_t);
 }
 
 static bool use_sample() {
@@ -1142,11 +1617,15 @@ static std::string read_file(const std::string &path) {
 int main(const int argc, char **argv) {
     bool emit_c = false;
     bool no_cache = false;
+    bool pgo = false;
+    bool tune = false;
     std::string path;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg{argv[i]};
         if (arg == "--emit-c") emit_c = true;
         else if (arg == "--no-cache") no_cache = true;
+        else if (arg == "--pgo") pgo = true;
+        else if (arg == "--tune") tune = true;
         else path = argv[i];
     }
 
@@ -1165,13 +1644,25 @@ int main(const int argc, char **argv) {
             }
         }
 
-        const std::string c_source = generate_c(convert(program));
+        if (tune) {
+            run_tune(program);
+            return 0;
+        }
+        load_tuned(program);
         if (emit_c) {
+            const std::string c_source = generate_c(convert(program));
             std::fputs(c_source.c_str(), stdout);
             return 0;
         }
-        const LibraryHandle lib{build_library(c_source, no_cache)};
-        run_native(lib.fn);
+        if (pgo) {
+            run_pgo(program, no_cache);
+            std::fflush(nullptr);
+            ::_exit(0);
+        }
+        const LibraryHandle lib{build_library(program, no_cache)};
+        run_native(lib);
+        std::fflush(nullptr);
+        ::_exit(0);
     } catch (const std::exception &e) {
         std::println(stderr, "Error: {}", e.what());
         return 1;
