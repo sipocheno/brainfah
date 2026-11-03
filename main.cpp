@@ -138,9 +138,10 @@ namespace {
         int c{0};
     };
 
-    void affine_add_scaled(Affine &dst, const Affine &src, const int k) {
+    void affine_add_scaled(Affine &dst, const Affine src, const int k) {
         for (const auto &[cell, a]: src.coef) {
-            if (const int v = mod256(dst.coef[cell] + k * a); v == 0) dst.coef.erase(cell);
+            const int v = mod256(dst.coef[cell] + k * a);
+            if (v == 0) dst.coef.erase(cell);
             else dst.coef[cell] = v;
         }
         dst.c = mod256(dst.c + k * src.c);
@@ -176,7 +177,7 @@ namespace {
                 case Op::MulAdd:
                 case Op::MulAddClear: {
                     if (ins.off == ins.off2) return false;
-                    const Affine &src = get(ins.off);
+                    const Affine src = get(ins.off);
                     affine_add_scaled(get(ins.off2), src, ins.arg);
                     if (ins.op == Op::MulAddClear) f[ins.off] = Affine{.coef = {}, .c = 0};
                     break;
@@ -335,6 +336,8 @@ namespace {
             }
             if (ins.op == Op::JumpIfNotZero || ins.op == Op::EndIf) {
                 --inner_depth;
+                // A loop/if on the base cell can only be left with that cell equal to zero.
+                if (inner_depth == 0 && ins.off == base) base_zeroed = true;
                 continue;
             }
             if (inner_depth == 0) {
@@ -691,21 +694,6 @@ static ProgramIr convert(const std::string_view program) {
     // Before emitting ANY hardware pointer movement (Move, Scan, MoveJnz) inside enclosing loops,
     // we must ensure all currently open enclosing loops have their `base` rebased to 0 so that
     // their opening `while (p[0])` and closing `}` operate on the hardware pointer `p` directly!
-    const auto ensure_enclosing_loops_rebased = [&] {
-        for (std::size_t s = 0; s < stack.size(); ++s) {
-            if (stack[s].base != 0) {
-                const int b = stack[s].base;
-                rebase_loop_to_zero(result, stack[s]);
-                // Adjust subsequent nested loops on the stack that were inside `stack[s]`
-                for (std::size_t inner = s + 1; inner < stack.size(); ++inner) {
-                    stack[inner].base -= b;
-                    // Re-sync `open` index of inner loop if `rebase_loop_to_zero` inserted/erased a Move
-                }
-                pending -= b;
-            }
-        }
-    };
-
     const auto add = [&](const int delta) {
         for (std::size_t i = result.size(); i-- > 0;) {
             auto &[op, arg, off, off2, off3] = result[i];
@@ -843,7 +831,7 @@ static ProgramIr convert(const std::string_view program) {
     if (!stack.empty()) throw std::runtime_error{"Unclosed ["};
     result.push_back({.op = Op::Halt, .arg = 0});
 
-    (void) ensure_enclosing_loops_rebased;
+
     return pre_evaluate(result);
 }
 
@@ -858,13 +846,14 @@ struct Config {
     int flagset{0}; // extra clang flags, see config_flags()
     int promote{28}; // max cells held in registers for one promoted loop
     int strided{1}; // carry loop-carried cells of strided record loops in registers
+    int pgo{0}; // build with a profile trained on this program (see train_pgo)
     int branchless{0}; // 0 = off, 1 = if-convert `if (cell)` bodies up to 4 ops, 2 = up to 12 ops
 };
 
 static Config g_cfg;
 
 static std::string config_tag(const Config &c) {
-    return std::format("s{}f{}p{}b{}u{}r{}", c.scan, c.flagset, c.promote, c.branchless, c.unroll, c.strided);
+    return std::format("s{}f{}p{}b{}u{}r{}g{}", c.scan, c.flagset, c.promote, c.branchless, c.unroll, c.strided, c.pgo);
 }
 
 static std::string config_flags(const int flagset) {
@@ -1626,13 +1615,21 @@ static Toolchain get_toolchain() {
     return t;
 }
 
+static fs::path pgo_profile_path(const std::string &program, const Toolchain &tc);
+
 static std::string build_library(const std::string &program, const bool no_cache,
                                  const std::string &extra = {}, const std::string &tag = {}) {
     const Toolchain tc = get_toolchain();
-    const std::string all_extra = extra + " " + config_flags(g_cfg.flagset);
+    std::string pgo_flags;
+    if (g_cfg.pgo) {
+        const fs::path prof = pgo_profile_path(program, tc);
+        if (!fs::exists(prof)) throw std::runtime_error{"PGO profile missing: " + prof.string()};
+        pgo_flags = " -fprofile-use=" + shell_quote(prof.string());
+    }
+    const std::string all_extra = extra + " " + config_flags(g_cfg.flagset) + pgo_flags;
     const std::string key = std::format(
         "{:016x}", fnv1a(program + '\n' + tc.cc_id + '\n' + tc.flags + '\n' + all_extra + '\n' + tag + '\n' +
-                         config_tag(g_cfg) + "\ncodegen-v9"));
+                         config_tag(g_cfg) + "\ncodegen-v11"));
     const fs::path lib = tc.dir / ("bf_" + key + tc.ext);
 
     if (no_cache || !fs::exists(lib)) {
@@ -1740,6 +1737,7 @@ static void run_native(const LibraryHandle &lib) {
         ::munmap(region, total);
         throw std::runtime_error{"Pointer out of bounds"};
     }
+    ::munmap(region, total);
 }
 
 // llvm-profdata must match the compiler's raw profile version, so prefer the one sitting next to the compiler.
@@ -1753,37 +1751,81 @@ static std::string find_profdata(const std::string &cc) {
     return "xcrun llvm-profdata";
 }
 
-// Profile-guided build: first run trains (instrumented, runs the program for real), later runs use the profile.
+// Profile path depends on the program, toolchain and every codegen knob except `pgo` itself.
+static fs::path pgo_profile_path(const std::string &program, const Toolchain &tc) {
+    Config c = g_cfg;
+    c.pgo = 0;
+    const std::string base = std::format(
+        "{:016x}", fnv1a(program + '\n' + tc.cc_id + '\n' + tc.flags + '\n' + config_tag(c) + "\npgo-v3"));
+    return tc.dir / ("bf_" + base + ".profdata");
+}
+
+// Runs an instrumented build of the program and merges the raw profile. With `quiet` the run happens in a forked
+// child with stdio on /dev/null (used by --tune); otherwise it is the user's real run in this process.
+static void train_pgo(const std::string &program, const bool quiet) {
+    const Toolchain tc = get_toolchain();
+    const fs::path prof = pgo_profile_path(program, tc);
+    const fs::path raw = tc.dir / std::format("{}.{}.profraw", prof.stem().string(), ::getpid());
+    ::setenv("LLVM_PROFILE_FILE", raw.c_str(), 1);
+
+    const Config saved = g_cfg;
+    g_cfg.pgo = 0;
+    const std::string gen = build_library(program, true, "-fprofile-instr-generate -DBF_PGO", "pgo-gen");
+    g_cfg = saved;
+
+    const auto run = [&gen] {
+        const LibraryHandle lib{gen};
+        run_native(lib);
+        if (lib.dump) lib.dump();
+    };
+    if (quiet) {
+        const pid_t pid = ::fork();
+        if (pid < 0) throw std::runtime_error{"fork failed"};
+        if (pid == 0) {
+            const int dn = ::open("/dev/null", O_RDWR);
+            if (dn >= 0) {
+                ::dup2(dn, 0);
+                ::dup2(dn, 1);
+                ::dup2(dn, 2);
+            }
+            ::alarm(300);
+            try {
+                run();
+            } catch (...) {
+                ::_exit(1);
+            }
+            ::_exit(0);
+        }
+        int st = 0;
+        ::waitpid(pid, &st, 0);
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) throw std::runtime_error{"PGO training run failed"};
+    } else {
+        run();
+    }
+
+    const fs::path tmp = tc.dir / std::format("{}.{}.tmp.profdata", prof.stem().string(), ::getpid());
+    const std::string cmd = find_profdata(tc.cc) + " merge -output=" + shell_quote(tmp.string()) + " " +
+                            shell_quote(raw.string());
+    const int rc = std::system(cmd.c_str());
+    std::error_code ec;
+    fs::remove(raw, ec);
+    if (rc != 0) {
+        fs::remove(tmp, ec);
+        throw std::runtime_error{"llvm-profdata merge failed (set BF_PROFDATA to its path)"};
+    }
+    fs::rename(tmp, prof);
+}
+
+// --pgo: the first run trains (it is the real run of the program), later runs use the profile.
 static void run_pgo(const std::string &program, const bool no_cache) {
     const Toolchain tc = get_toolchain();
-    const std::string base = std::format(
-        "{:016x}", fnv1a(program + '\n' + tc.cc_id + '\n' + tc.flags + '\n' + config_tag(g_cfg) + "\npgo-v2"));
-    const fs::path prof = tc.dir / ("bf_" + base + ".profdata");
-    const std::string use_flags = "-fprofile-use=" + shell_quote(prof.string());
-
-    if (no_cache || !fs::exists(prof)) {
-        const fs::path raw = tc.dir / std::format("bf_{}_{}.profraw", base, ::getpid());
-        ::setenv("LLVM_PROFILE_FILE", raw.c_str(), 1);
-        {
-            const LibraryHandle lib{build_library(program, true, "-fprofile-instr-generate -DBF_PGO", "pgo-gen")};
-            run_native(lib);
-            if (lib.dump) lib.dump();
-        }
-        const fs::path tmp = tc.dir / std::format("bf_{}_{}.tmp.profdata", base, ::getpid());
-        const std::string cmd = find_profdata(tc.cc) + " merge -output=" +
-                                shell_quote(tmp.string()) + " " + shell_quote(raw.string());
-        const int rc = std::system(cmd.c_str());
-        std::error_code ec;
-        fs::remove(raw, ec);
-        if (rc != 0) {
-            fs::remove(tmp, ec);
-            throw std::runtime_error{"llvm-profdata merge failed (set BF_PROFDATA to its path)"};
-        }
-        fs::rename(tmp, prof);
-        (void) build_library(program, true, use_flags, "pgo-use"); // warm the cache for the next run
+    g_cfg.pgo = 1;
+    if (no_cache || !fs::exists(pgo_profile_path(program, tc))) {
+        train_pgo(program, false);
+        (void) build_library(program, true); // warm the cache for the next run
         return;
     }
-    const LibraryHandle lib{build_library(program, no_cache, use_flags, "pgo-use")};
+    const LibraryHandle lib{build_library(program, no_cache)};
     run_native(lib);
 }
 
@@ -1800,8 +1842,8 @@ static void load_tuned(const std::string &program) {
     const Toolchain tc = get_toolchain();
     std::ifstream f{tune_file(program, tc)};
     Config c;
-    if (f >> c.scan >> c.flagset >> c.promote >> c.branchless >> c.unroll >> c.strided && c.strided >= 0 && c.strided <=
-        1 && c.unroll >= 2 && c.unroll <= 16 &&
+    if (f >> c.scan >> c.flagset >> c.promote >> c.branchless >> c.unroll >> c.strided >> c.pgo && c.pgo >= 0 && c.pgo
+        <= 1 && c.strided >= 0 && c.strided <= 1 && c.unroll >= 2 && c.unroll <= 16 &&
         c.branchless >= 0 && c.branchless <= 2 && c.scan >= 0 && c.scan <= 3 && c.flagset >= 0 && c.flagset <= 4 &&
         c.promote >= 4 && c.promote <= 128) {
         g_cfg = c;
@@ -1894,10 +1936,20 @@ static void run_tune(const std::string &program) {
         try_cfg(cand);
     }
 
+    try {
+        g_cfg = best;
+        train_pgo(program, true);
+        Config cand = best;
+        cand.pgo = 1;
+        try_cfg(cand);
+    } catch (const std::exception &e) {
+        std::println(stderr, "         pgo skipped: {}", e.what());
+    }
+
     const Toolchain tc = get_toolchain();
     std::ofstream out{tune_file(program, tc), std::ios::trunc};
     out << best.scan << ' ' << best.flagset << ' ' << best.promote << ' ' << best.branchless << ' ' << best.unroll <<
-            ' ' << best.strided << '\n';
+            ' ' << best.strided << ' ' << best.pgo << '\n';
     g_cfg = best;
     std::println(stderr, "selected {} ({:.3f}s)", config_tag(best), best_t);
 }
@@ -1940,6 +1992,7 @@ int main(const int argc, char **argv) {
             return 0;
         }
         load_tuned(program);
+        if (g_cfg.pgo && !fs::exists(pgo_profile_path(program, get_toolchain()))) g_cfg.pgo = 0;
         if (emit_c) {
             const std::string c_source = generate_c(convert(program));
             std::fputs(c_source.c_str(), stdout);
