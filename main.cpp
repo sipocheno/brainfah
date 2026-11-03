@@ -138,7 +138,7 @@ namespace {
         int c{0};
     };
 
-    void affine_add_scaled(Affine &dst, const Affine src, const int k) {
+    void affine_add_scaled(Affine &dst, const Affine &src, const int k) {
         for (const auto &[cell, a]: src.coef) {
             const int v = mod256(dst.coef[cell] + k * a);
             if (v == 0) dst.coef.erase(cell);
@@ -164,11 +164,10 @@ namespace {
         };
 
         for (std::size_t i = open + 1; i < code.size(); ++i) {
-            const Ir &ins = code[i];
-            switch (ins.op) {
+            switch (const Ir &ins = code[i]; ins.op) {
                 case Op::Add: {
-                    Affine &e = get(ins.off);
-                    e.c = mod256(e.c + ins.arg);
+                    auto &[coef, c] = get(ins.off);
+                    c = mod256(c + ins.arg);
                     break;
                 }
                 case Op::Set:
