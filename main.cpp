@@ -42,6 +42,7 @@ namespace {
         EndIf, // }
         MulAdd, // p[off2] += arg * p[off]
         MulAddClear, // p[off2] += arg * p[off]; p[off] = 0
+        MulCells, // p[off2] += arg * p[off] * p[off3]
         Scan, // while (*p) p += arg
         MoveJnz, // p += off2; }
         Halt
@@ -52,6 +53,7 @@ namespace {
         int arg{};
         int off{};
         int off2{};
+        int off3{};
     };
 
     struct Loop {
@@ -88,8 +90,12 @@ namespace {
         if (loop.base == 0) return;
         const int b = loop.base;
         for (std::size_t k = loop.open; k < code.size(); ++k) {
-            auto &[op, arg, off, off2] = code[k];
-            if (op == Op::MulAdd || op == Op::MulAddClear) {
+            auto &[op, arg, off, off2, off3] = code[k];
+            if (op == Op::MulCells) {
+                off -= b;
+                off2 -= b;
+                off3 -= b;
+            } else if (op == Op::MulAdd || op == Op::MulAddClear) {
                 off -= b;
                 off2 -= b;
             } else if (op != Op::Move && op != Op::Scan && op != Op::Halt) {
@@ -124,6 +130,130 @@ namespace {
             ++loop.open;
         }
         loop.base = 0;
+    }
+
+    // Affine summary of a straight-line loop body: cell -> (sum of coef*entry_cell + constant), all mod 256.
+    struct Affine {
+        std::map<int, int> coef;
+        int c{0};
+    };
+
+    void affine_add_scaled(Affine &dst, const Affine &src, const int k) {
+        for (const auto &[cell, a]: src.coef) {
+            if (const int v = mod256(dst.coef[cell] + k * a); v == 0) dst.coef.erase(cell);
+            else dst.coef[cell] = v;
+        }
+        dst.c = mod256(dst.c + k * src.c);
+    }
+
+    // Closed form for counting loops whose body is straight-line Add/Set/MulAdd/MulAddClear, e.g. the classic
+    // multiplication idiom x[->y[->+>+<<]>>[-<<+>>]<<<]. The first iteration is kept verbatim (it may see arbitrary
+    // values in scratch cells); all later iterations are summarized: scratch cells become constants, the counter
+    // steps by an odd constant d, and every other changed cell is an accumulator of invariant cells, so
+    //   n = -counter * inv(d)  iterations  =>  acc += n * (b + sum a_z * z)
+    // which needs only MulAdd and the cell-product op MulCells.
+    bool try_optimize_affine(std::vector<Ir> &code, const std::size_t open, const int base) {
+        if (code.size() - open > 48) return false;
+
+        std::map<int, Affine> f;
+        const auto get = [&f](const int cell) -> Affine & {
+            auto [it, inserted] = f.try_emplace(cell);
+            if (inserted) it->second.coef[cell] = 1;
+            return it->second;
+        };
+
+        for (std::size_t i = open + 1; i < code.size(); ++i) {
+            const Ir &ins = code[i];
+            switch (ins.op) {
+                case Op::Add: {
+                    Affine &e = get(ins.off);
+                    e.c = mod256(e.c + ins.arg);
+                    break;
+                }
+                case Op::Set:
+                    f[ins.off] = Affine{.coef = {}, .c = mod256(ins.arg)};
+                    break;
+                case Op::MulAdd:
+                case Op::MulAddClear: {
+                    if (ins.off == ins.off2) return false;
+                    const Affine &src = get(ins.off);
+                    affine_add_scaled(get(ins.off2), src, ins.arg);
+                    if (ins.op == Op::MulAddClear) f[ins.off] = Affine{.coef = {}, .c = 0};
+                    break;
+                }
+                default:
+                    return false;
+            }
+        }
+
+        if (!f.contains(base)) return false;
+
+        // Cells that end every iteration with a constant (cleared / Set): their entry value is that constant
+        // from the second iteration on.
+        std::map<int, int> known;
+        for (const auto &[cell, e]: f) {
+            if (e.coef.empty()) known[cell] = e.c;
+        }
+        if (known.contains(base)) return false;
+
+        std::map<int, Affine> g;
+        for (const auto &[cell, e]: f) {
+            if (known.contains(cell)) continue;
+            Affine ne;
+            ne.c = e.c;
+            for (const auto &[z, a]: e.coef) {
+                if (const auto kz = known.find(z); kz != known.end()) {
+                    ne.c = mod256(ne.c + a * kz->second);
+                } else {
+                    ne.coef[z] = a;
+                }
+            }
+            g[cell] = std::move(ne);
+        }
+
+        const Affine &gb = g.at(base);
+        if (gb.coef.size() != 1 || gb.coef.begin()->first != base || gb.coef.begin()->second != 1 ||
+            (gb.c & 1) == 0) {
+            return false;
+        }
+        const int d = gb.c;
+
+        std::set<int> acc;
+        for (const auto &[cell, e]: g) {
+            if (cell == base) continue;
+            const auto self = e.coef.find(cell);
+            if (self == e.coef.end() || self->second != 1) return false; // copy-like or geometric: give up
+            if (e.coef.size() == 1 && e.c == 0) continue; // invariant
+            acc.insert(cell);
+        }
+        for (const int y: acc) {
+            for (const auto &[z, a]: g.at(y).coef) {
+                if (z == y) continue;
+                if (z == base || acc.contains(z)) return false;
+            }
+        }
+
+        const int nf = mod256(-inverse256(d));
+        std::vector<Ir> tail;
+        for (const int y: acc) {
+            const Affine &e = g.at(y);
+            if (const int k = mod256(nf * e.c); k != 0) {
+                tail.push_back({.op = Op::MulAdd, .arg = k, .off = base, .off2 = y});
+            }
+            for (const auto &[z, a]: e.coef) {
+                if (z == y) continue;
+                if (const int k = mod256(nf * a); k != 0) {
+                    tail.push_back({.op = Op::MulCells, .arg = k, .off = base, .off2 = y, .off3 = z});
+                }
+            }
+        }
+        tail.push_back({.op = Op::Set, .arg = 0, .off = base});
+
+        code[open].op = Op::IfNonZero;
+        code.insert(code.end(), tail.begin(), tail.end());
+        code.push_back({.op = Op::EndIf, .arg = static_cast<int>(open), .off = base});
+        code[open].arg = static_cast<int>(code.size() - 1);
+        return true;
     }
 
     bool try_optimize_balanced(std::vector<Ir> &code, const std::size_t open, const int base) {
@@ -212,11 +342,13 @@ namespace {
                     (ins.op == Op::MulAddClear && ins.off == base && ins.off2 != base)) {
                     base_zeroed = true;
                 } else if (ins.off == base ||
-                           ((ins.op == Op::MulAdd || ins.op == Op::MulAddClear) && ins.off2 == base)) {
+                           ((ins.op == Op::MulAdd || ins.op == Op::MulAddClear || ins.op == Op::MulCells) &&
+                            ins.off2 == base)) {
                     base_zeroed = false;
                 }
             } else {
-                if (ins.off == base || ((ins.op == Op::MulAdd || ins.op == Op::MulAddClear) && ins.off2 == base)) {
+                if (ins.off == base || ((ins.op == Op::MulAdd || ins.op == Op::MulAddClear || ins.op == Op::MulCells) &&
+                                        ins.off2 == base)) {
                     base_zeroed = false;
                 }
             }
@@ -228,7 +360,7 @@ namespace {
             return true;
         }
 
-        return false;
+        return try_optimize_affine(code, open, base);
     }
 
     int get_known_value(const std::vector<Ir> &code, const int off, const bool at_top_level,
@@ -251,6 +383,7 @@ namespace {
                     if (ins.off == off) return -1;
                     break;
                 case Op::MulAdd:
+                case Op::MulCells:
                     if (ins.off2 == off) return -1;
                     break;
                 case Op::Out:
@@ -313,7 +446,7 @@ namespace {
                     ok = false;
                     break;
                 }
-                const auto &[op, arg, off, off2] = ir[cur];
+                const auto &[op, arg, off, off2, off3] = ir[cur];
                 switch (op) {
                     case Op::Add: {
                         const std::ptrdiff_t idx = ptr + off;
@@ -394,6 +527,23 @@ namespace {
                             min_touched = std::min({min_touched, src, dst});
                             max_touched = std::max({max_touched, src, dst});
                         }
+                        ++cur;
+                        break;
+                    }
+                    case Op::MulCells: {
+                        const std::ptrdiff_t a = ptr + off;
+                        const std::ptrdiff_t b = ptr + off3;
+                        const std::ptrdiff_t dst = ptr + off2;
+                        if (!in_bounds(a) || !in_bounds(b) || !in_bounds(dst)) {
+                            ok = false;
+                            break;
+                        }
+                        const std::uint8_t av = tape[static_cast<std::size_t>(a)];
+                        const std::uint8_t bv = tape[static_cast<std::size_t>(b)];
+                        tape[static_cast<std::size_t>(dst)] = static_cast<std::uint8_t>(
+                            tape[static_cast<std::size_t>(dst)] + static_cast<unsigned int>(arg) * av * bv);
+                        min_touched = std::min({min_touched, a, b, dst});
+                        max_touched = std::max({max_touched, a, b, dst});
                         ++cur;
                         break;
                     }
@@ -558,7 +708,7 @@ static ProgramIr convert(const std::string_view program) {
 
     const auto add = [&](const int delta) {
         for (std::size_t i = result.size(); i-- > 0;) {
-            auto &[op, arg, off, off2] = result[i];
+            auto &[op, arg, off, off2, off3] = result[i];
             if (op == Op::Add || op == Op::Set) {
                 if (off == pending) {
                     arg = mod256(arg + delta);
@@ -702,16 +852,19 @@ static ProgramIr convert(const std::string_view program) {
 // ---------------------------------------------------------------------------
 // Tunable code-generation / compiler-flag knobs; `--tune` picks the fastest combination for a given program.
 struct Config {
-    int scan{1}; // 0 = scalar scans, 1 = NEON for stride +-1 only, 2 = NEON for all strides (measured slower)
+    int scan{3};
+    // 0 = plain scalar, 1 = NEON for stride +-1 only, 2 = NEON for all strides (slow), 3 = NEON +-1, unrolled multi-exit scalar otherwise
+    int unroll{4}; // unroll factor of the multi-exit scalar scans (scan == 3)
     int flagset{0}; // extra clang flags, see config_flags()
     int promote{28}; // max cells held in registers for one promoted loop
+    int strided{1}; // carry loop-carried cells of strided record loops in registers
     int branchless{0}; // 0 = off, 1 = if-convert `if (cell)` bodies up to 4 ops, 2 = up to 12 ops
 };
 
 static Config g_cfg;
 
 static std::string config_tag(const Config &c) {
-    return std::format("s{}f{}p{}b{}", c.scan, c.flagset, c.promote, c.branchless);
+    return std::format("s{}f{}p{}b{}u{}r{}", c.scan, c.flagset, c.promote, c.branchless, c.unroll, c.strided);
 }
 
 static std::string config_flags(const int flagset) {
@@ -788,6 +941,28 @@ static inline u8* scan_left_@S@(u8 *p) { while (*p) p -= @S@; return p; }
         out += t;
         out += '\n';
     }
+}
+
+// Multi-exit unrolled scalar scans for strides other than +-1: every probe has its own branch, which the
+// predictor learns per position, and the pointer is bumped once per `unroll` probes.
+static void emit_unrolled_scans(std::string &out, const std::vector<Ir> &ir) {
+    std::set<int> strides;
+    for (const Ir &in: ir) {
+        if (in.op == Op::Scan && std::abs(in.arg) >= 2) strides.insert(in.arg);
+    }
+    for (const int s: strides) {
+        const int a = std::abs(s);
+        std::string body;
+        for (int k = 0; k < g_cfg.unroll; ++k) {
+            const int d = k * s;
+            if (d == 0) body += "if (!p[0]) return p; ";
+            else body += std::format("if (!p[{}]) return p + {}; ", d, d);
+        }
+        out += std::format(
+            "static inline __attribute__((always_inline)) u8* bf_scan_{}{}(u8 *p) {{ for (;;) {{ {}p += {}; }} }}\n",
+            s > 0 ? "p" : "n", a, body, g_cfg.unroll * s);
+    }
+    out += '\n';
 }
 
 static std::string generate_c(const ProgramIr &prog) {
@@ -918,6 +1093,7 @@ static std::string generate_c(const ProgramIr &prog) {
             "static inline u8* scan_left_4(u8 *p) { while (*p) p -= 4; return p; }\n"
             "#endif\n\n";
     if (g_cfg.scan == 2) emit_generic_scans(out, ir);
+    if (g_cfg.scan == 3) emit_unrolled_scans(out, ir);
     out +=
             "static u8 out_buf[65536];\n"
             "static size_t out_pos;\n"
@@ -1035,6 +1211,104 @@ static std::string generate_c(const ProgramIr &prog) {
         return end_idx;
     };
 
+    // Strided record loops `while (p[t]) { straight-line body; p += s; }`: keep the body's cells in registers and carry
+    // values that the next iteration reads at a shifted offset (written at o, read at o - s) in a register instead of
+    // going through memory, which removes the store->load forwarding latency from the loop-carried chain.
+    const auto try_strided = [&](const std::size_t open) -> std::size_t {
+        if (!g_cfg.strided) return 0;
+        const auto end_idx = static_cast<std::size_t>(ir[open].arg);
+        if (ir[end_idx].op != Op::MoveJnz) return 0;
+        const int s = ir[end_idx].off2;
+        if (s == 0) return 0;
+
+        std::set<int> reads;
+        std::set<int> writes;
+        reads.insert(ir[open].off);
+        for (std::size_t k = open + 1; k < end_idx; ++k) {
+            const Ir &b = ir[k];
+            switch (b.op) {
+                case Op::Add:
+                    reads.insert(b.off);
+                    writes.insert(b.off);
+                    break;
+                case Op::Set:
+                    writes.insert(b.off);
+                    break;
+                case Op::MulAdd:
+                case Op::MulAddClear:
+                    reads.insert(b.off);
+                    reads.insert(b.off2);
+                    writes.insert(b.off2);
+                    if (b.op == Op::MulAddClear) writes.insert(b.off);
+                    break;
+                case Op::MulCells:
+                    reads.insert(b.off);
+                    reads.insert(b.off2);
+                    reads.insert(b.off3);
+                    writes.insert(b.off2);
+                    break;
+                default:
+                    return 0;
+            }
+        }
+        std::set<int> all = reads;
+        all.insert(writes.begin(), writes.end());
+        if (all.size() > static_cast<std::size_t>(g_cfg.promote)) return 0;
+
+        std::set<int> carried; // offsets whose value arrives from the previous iteration's register
+        for (const int o: writes) {
+            if (reads.contains(o - s)) carried.insert(o - s);
+        }
+
+        line("{");
+        ++depth;
+        for (const int o: all) line(std::format("u8 {} = 0;", make_reg(o)));
+        for (const int o: carried) line(std::format("{} = p[{}];", make_reg(o), o));
+        line("for (;;) {");
+        ++depth;
+        for (const int o: reads) {
+            if (!carried.contains(o)) line(std::format("{} = p[{}];", make_reg(o), o));
+        }
+        line(std::format("if (!{}) break;", make_reg(ir[open].off)));
+        for (std::size_t k = open + 1; k < end_idx; ++k) {
+            const Ir &b = ir[k];
+            switch (b.op) {
+                case Op::Add:
+                    line(std::format("{} += {}u;", make_reg(b.off), mod256(b.arg)));
+                    break;
+                case Op::Set:
+                    line(std::format("{} = {}u;", make_reg(b.off), mod256(b.arg)));
+                    break;
+                case Op::MulCells:
+                    line(std::format("{} += (u8)({}u * {} * {});", make_reg(b.off2), b.arg, make_reg(b.off),
+                                     make_reg(b.off3)));
+                    break;
+                default:
+                    if (b.arg == 1) {
+                        line(std::format("{} += {};", make_reg(b.off2), make_reg(b.off)));
+                    } else if (b.arg == 255) {
+                        line(std::format("{} -= {};", make_reg(b.off2), make_reg(b.off)));
+                    } else {
+                        line(std::format("{} += (u8)({}u * {});", make_reg(b.off2), b.arg, make_reg(b.off)));
+                    }
+                    if (b.op == Op::MulAddClear) line(std::format("{} = 0;", make_reg(b.off)));
+                    break;
+            }
+        }
+        for (const int o: writes) line(std::format("p[{}] = {};", o, make_reg(o)));
+        std::vector<int> order(writes.begin(), writes.end());
+        if (s < 0) std::ranges::reverse(order);
+        for (const int o: order) {
+            if (carried.contains(o - s)) line(std::format("{} = {};", make_reg(o - s), make_reg(o)));
+        }
+        line(std::format("p += {};", s));
+        --depth;
+        line("}");
+        --depth;
+        line("}");
+        return end_idx;
+    };
+
     for (std::size_t i = 0; i < ir.size(); ++i) {
         const Ir &in = ir[i];
         switch (in.op) {
@@ -1066,6 +1340,10 @@ static std::string generate_c(const ProgramIr &prog) {
                 line("}");
                 break;
             case Op::JumpIfZero: {
+                if (const std::size_t e = try_strided(i); e != 0) {
+                    i = e;
+                    break;
+                }
                 std::set<int> read_cells;
                 std::set<int> written_cells;
                 read_cells.insert(in.off);
@@ -1089,6 +1367,12 @@ static std::string generate_c(const ProgramIr &prog) {
                             read_cells.insert(body.off2);
                             written_cells.insert(body.off2);
                             if (body.op == Op::MulAddClear) written_cells.insert(body.off);
+                            break;
+                        case Op::MulCells:
+                            read_cells.insert(body.off);
+                            read_cells.insert(body.off2);
+                            read_cells.insert(body.off3);
+                            written_cells.insert(body.off2);
                             break;
                         case Op::JumpIfZero:
                         case Op::JumpIfNotZero:
@@ -1145,6 +1429,10 @@ static std::string generate_c(const ProgramIr &prog) {
                                                      make_reg(body.off)));
                                 }
                                 line(std::format("{} = 0;", make_reg(body.off)));
+                                break;
+                            case Op::MulCells:
+                                line(std::format("{} += (u8)({}u * {} * {});", make_reg(body.off2), body.arg,
+                                                 make_reg(body.off), make_reg(body.off3)));
                                 break;
                             case Op::JumpIfZero:
                                 line(std::format("while ({}) {{", make_reg(body.off)));
@@ -1216,7 +1504,14 @@ static std::string generate_c(const ProgramIr &prog) {
                 }
                 line(std::format("p[{}] = 0;", in.off));
                 break;
+            case Op::MulCells:
+                line(std::format("p[{}] += (u8)({}u * p[{}] * p[{}]);", in.off2, in.arg, in.off, in.off3));
+                break;
             case Op::Scan:
+                if (g_cfg.scan == 3 && std::abs(in.arg) >= 2) {
+                    line(std::format("p = bf_scan_{}{}(p);", in.arg > 0 ? "p" : "n", std::abs(in.arg)));
+                    break;
+                }
                 if (g_cfg.scan == 0 || (g_cfg.scan == 1 && std::abs(in.arg) != 1)) {
                     line(std::format("while (*p) p += {};", in.arg));
                     break;
@@ -1337,7 +1632,7 @@ static std::string build_library(const std::string &program, const bool no_cache
     const std::string all_extra = extra + " " + config_flags(g_cfg.flagset);
     const std::string key = std::format(
         "{:016x}", fnv1a(program + '\n' + tc.cc_id + '\n' + tc.flags + '\n' + all_extra + '\n' + tag + '\n' +
-                         config_tag(g_cfg) + "\ncodegen-v6"));
+                         config_tag(g_cfg) + "\ncodegen-v9"));
     const fs::path lib = tc.dir / ("bf_" + key + tc.ext);
 
     if (no_cache || !fs::exists(lib)) {
@@ -1505,8 +1800,9 @@ static void load_tuned(const std::string &program) {
     const Toolchain tc = get_toolchain();
     std::ifstream f{tune_file(program, tc)};
     Config c;
-    if (f >> c.scan >> c.flagset >> c.promote >> c.branchless && c.branchless >= 0 && c.branchless <= 2 && c.scan >= 0
-        && c.scan <= 2 && c.flagset >= 0 && c.flagset <= 4 &&
+    if (f >> c.scan >> c.flagset >> c.promote >> c.branchless >> c.unroll >> c.strided && c.strided >= 0 && c.strided <=
+        1 && c.unroll >= 2 && c.unroll <= 16 &&
+        c.branchless >= 0 && c.branchless <= 2 && c.scan >= 0 && c.scan <= 3 && c.flagset >= 0 && c.flagset <= 4 &&
         c.promote >= 4 && c.promote <= 128) {
         g_cfg = c;
     }
@@ -1572,6 +1868,16 @@ static void run_tune(const std::string &program) {
         cand.scan = v;
         try_cfg(cand);
     }
+    {
+        Config cand = best;
+        cand.strided = 0;
+        try_cfg(cand);
+    }
+    for (const int v: {2, 6, 8}) {
+        Config cand = best;
+        cand.unroll = v;
+        try_cfg(cand);
+    }
     for (int v = 1; v <= 4; ++v) {
         Config cand = best;
         cand.flagset = v;
@@ -1590,17 +1896,10 @@ static void run_tune(const std::string &program) {
 
     const Toolchain tc = get_toolchain();
     std::ofstream out{tune_file(program, tc), std::ios::trunc};
-    out << best.scan << ' ' << best.flagset << ' ' << best.promote << ' ' << best.branchless << '\n';
+    out << best.scan << ' ' << best.flagset << ' ' << best.promote << ' ' << best.branchless << ' ' << best.unroll <<
+            ' ' << best.strided << '\n';
     g_cfg = best;
     std::println(stderr, "selected {} ({:.3f}s)", config_tag(best), best_t);
-}
-
-static bool use_sample() {
-    std::print("Do you want to use sample hello world program for test? (y/n)\n>");
-    std::fflush(stdout);
-    std::string answer;
-    std::getline(std::cin, answer);
-    return !answer.empty() && (answer[0] == 'y' || answer[0] == 'Y');
 }
 
 static std::string read_file(const std::string &path) {
@@ -1630,19 +1929,11 @@ int main(const int argc, char **argv) {
     }
 
     try {
-        std::string program{};
-        if (!path.empty()) {
-            program = read_file(path);
-        } else {
-            program =
-                    "++++++++[>++++[>++>+++>+++>+<<<<-]>+>+>->>+[<]<-]>>.>\n"
-                    "---.+++++++..+++.>>.<-.<.+++.------.--------.>>+.>++.";
-            if (!use_sample()) {
-                std::println("Enter your brainfuck program:");
-                std::fflush(stdout);
-                std::getline(std::cin, program);
-            }
+        if (path.empty()) {
+            std::println(stderr, "Usage: {} [--emit-c] [--no-cache] [--pgo] [--tune] <program.bf>", argv[0]);
+            return 2;
         }
+        const std::string program = read_file(path);
 
         if (tune) {
             run_tune(program);
