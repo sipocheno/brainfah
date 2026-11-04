@@ -20,6 +20,8 @@
 #include <string>
 #include <string_view>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <utility>
 #include <vector>
@@ -138,7 +140,7 @@ namespace {
         int c{0};
     };
 
-    void affine_add_scaled(Affine &dst, const Affine &src, const int k) {
+    void affine_add_scaled(Affine &dst, const Affine src, const int k) {
         for (const auto &[cell, a]: src.coef) {
             const int v = mod256(dst.coef[cell] + k * a);
             if (v == 0) dst.coef.erase(cell);
@@ -164,10 +166,11 @@ namespace {
         };
 
         for (std::size_t i = open + 1; i < code.size(); ++i) {
-            switch (const Ir &ins = code[i]; ins.op) {
+            const Ir &ins = code[i];
+            switch (ins.op) {
                 case Op::Add: {
-                    auto &[coef, c] = get(ins.off);
-                    c = mod256(c + ins.arg);
+                    Affine &e = get(ins.off);
+                    e.c = mod256(e.c + ins.arg);
                     break;
                 }
                 case Op::Set:
@@ -1096,7 +1099,12 @@ static std::string generate_c(const ProgramIr &prog) {
             "        *out_pos = bf_flush(out_buf, *out_pos);\n"
             "    }\n"
             "}\n\n"
+            "static const u8 *bf_in;\n"
+            "static size_t bf_in_len, bf_in_pos;\n"
+            "static int bf_in_set;\n"
+            "void bf_set_input(const u8 *p, size_t n) { bf_in = p; bf_in_len = n; bf_in_pos = 0; bf_in_set = 1; }\n\n"
             "__attribute__((noinline)) static u8 bf_get(u8 *out_buf, size_t *pos) {\n"
+            "    if (bf_in_set) return bf_in_pos < bf_in_len ? bf_in[bf_in_pos++] : 0;\n"
             "    *pos = bf_flush(out_buf, *pos);\n"
             "    int c = getchar_unlocked();\n"
             "    return (u8)(c == EOF ? 0 : c);\n"
@@ -1616,8 +1624,18 @@ static Toolchain get_toolchain() {
 
 static fs::path pgo_profile_path(const std::string &program, const Toolchain &tc);
 
-static std::string build_library(const std::string &program, const bool no_cache,
-                                 const std::string &extra = {}, const std::string &tag = {}) {
+struct BuildPlan {
+    std::string lib; // final library path
+    bool cached{false};
+    std::string cmd; // compile command, writes to `tmp`
+    fs::path src;
+    fs::path tmp;
+};
+
+// Computes the cache key/paths. With `generate` the C source is written and the compile command is prepared.
+static BuildPlan plan_build(const std::string &program, const bool no_cache, const std::string &extra = {},
+                            const std::string &tag = {}, const ProgramIr *prebuilt = nullptr,
+                            const bool generate = true) {
     const Toolchain tc = get_toolchain();
     std::string pgo_flags;
     if (g_cfg.pgo) {
@@ -1628,32 +1646,44 @@ static std::string build_library(const std::string &program, const bool no_cache
     const std::string all_extra = extra + " " + config_flags(g_cfg.flagset) + pgo_flags;
     const std::string key = std::format(
         "{:016x}", fnv1a(program + '\n' + tc.cc_id + '\n' + tc.flags + '\n' + all_extra + '\n' + tag + '\n' +
-                         config_tag(g_cfg) + "\ncodegen-v11"));
+                         config_tag(g_cfg) + "\ncodegen-v12"));
     const fs::path lib = tc.dir / ("bf_" + key + tc.ext);
 
-    if (no_cache || !fs::exists(lib)) {
-        const fs::path tmp = tc.dir / std::format("bf_{}_{}.tmp{}", key, ::getpid(), tc.ext);
-        const fs::path src = tc.dir / std::format("bf_{}_{}.c", key, ::getpid());
-        {
-            const std::string c_source = generate_c(convert(program));
-            std::ofstream f{src, std::ios::binary | std::ios::trunc};
-            f.write(c_source.data(), static_cast<std::streamsize>(c_source.size()));
-            f.flush();
-            if (!f) throw std::runtime_error{"Failed to write temporary C source"};
-        }
-        const std::string cmd = tc.cc + " " + tc.flags + " " + all_extra + " -fPIC -shared -w -x c " +
-                                shell_quote(src.string()) + " -o " + shell_quote(tmp.string());
-        const int rc = std::system(cmd.c_str());
-
-        std::error_code ec;
-        fs::remove(src, ec);
-        if (rc != 0) {
-            fs::remove(tmp, ec);
-            throw std::runtime_error{"Compilation failed (command: " + cmd + ")"};
-        }
-        fs::rename(tmp, lib);
+    BuildPlan plan;
+    plan.lib = lib.string();
+    if (!no_cache && fs::exists(lib)) {
+        plan.cached = true;
+        return plan;
     }
-    return lib.string();
+    if (!generate) return plan;
+
+    plan.tmp = tc.dir / std::format("bf_{}_{}.tmp{}", key, ::getpid(), tc.ext);
+    plan.src = tc.dir / std::format("bf_{}_{}.c", key, ::getpid());
+    {
+        const std::string c_source = generate_c(prebuilt ? *prebuilt : convert(program));
+        std::ofstream f{plan.src, std::ios::binary | std::ios::trunc};
+        f.write(c_source.data(), static_cast<std::streamsize>(c_source.size()));
+        f.flush();
+        if (!f) throw std::runtime_error{"Failed to write temporary C source"};
+    }
+    plan.cmd = tc.cc + " " + tc.flags + " " + all_extra + " -fPIC -shared -w -x c " + shell_quote(plan.src.string()) +
+               " -o " + shell_quote(plan.tmp.string());
+    return plan;
+}
+
+static std::string build_library(const std::string &program, const bool no_cache,
+                                 const std::string &extra = {}, const std::string &tag = {}) {
+    const BuildPlan plan = plan_build(program, no_cache, extra, tag);
+    if (plan.cached) return plan.lib;
+    const int rc = std::system(plan.cmd.c_str());
+    std::error_code ec;
+    fs::remove(plan.src, ec);
+    if (rc != 0) {
+        fs::remove(plan.tmp, ec);
+        throw std::runtime_error{"Compilation failed (command: " + plan.cmd + ")"};
+    }
+    fs::rename(plan.tmp, plan.lib);
+    return plan.lib;
 }
 
 using RunFn = void (*)(unsigned char *);
@@ -1666,6 +1696,8 @@ struct LibraryHandle {
 
     void (*dump)(){nullptr};
 
+    void (*set_input)(const unsigned char *, std::size_t){nullptr};
+
     explicit LibraryHandle(const std::string &path) {
         handle = ::dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
         if (!handle) throw std::runtime_error{std::string{"dlopen failed: "} + ::dlerror()};
@@ -1677,6 +1709,7 @@ struct LibraryHandle {
         fn = reinterpret_cast<RunFn>(sym);
         flush = reinterpret_cast<void (*)()>(::dlsym(handle, "bf_flush_out"));
         dump = reinterpret_cast<void (*)()>(::dlsym(handle, "bf_pgo_dump"));
+        set_input = reinterpret_cast<void (*)(const unsigned char *, std::size_t)>(::dlsym(handle, "bf_set_input"));
     }
 
     // Intentionally no dlclose: the process exits right after the run.
@@ -1715,28 +1748,301 @@ static bool call_guarded(const RunFn fn, unsigned char *base) {
     return ok;
 }
 
-static void run_native(const LibraryHandle &lib) {
+struct TapeMap {
+    void *region{nullptr};
+    std::size_t total{0};
+    unsigned char *base{nullptr};
+};
+
+static TapeMap alloc_tape() {
     const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
     const std::size_t tape_bytes = (TAPE_SIZE + page - 1) / page * page;
     const std::size_t guard = (GUARD_SIZE + page - 1) / page * page;
-    const std::size_t total = guard * 2 + tape_bytes;
+    TapeMap t;
+    t.total = guard * 2 + tape_bytes;
 
-    void *region = ::mmap(nullptr, total, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
-    if (region == MAP_FAILED) throw std::runtime_error{"mmap failed"};
+    t.region = ::mmap(nullptr, t.total, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+    if (t.region == MAP_FAILED) throw std::runtime_error{"mmap failed"};
 
-    auto *tape_start = static_cast<unsigned char *>(region) + guard;
+    auto *tape_start = static_cast<unsigned char *>(t.region) + guard;
     if (::mprotect(tape_start, tape_bytes, PROT_READ | PROT_WRITE) != 0) {
-        ::munmap(region, total);
+        ::munmap(t.region, t.total);
         throw std::runtime_error{"mprotect failed"};
     }
+    t.base = tape_start + TAPE_OFFSET;
+    return t;
+}
 
-    unsigned char *base = tape_start + TAPE_OFFSET;
-    if (!call_guarded(lib.fn, base)) {
+// Program input preloaded from a regular-file stdin (then both tiers read it from memory, no stdio involved).
+static std::string g_stdin_data;
+static bool g_stdin_loaded = false;
+
+static void preload_stdin_if_regular() {
+    struct stat st{};
+    if (::fstat(STDIN_FILENO, &st) != 0 || !S_ISREG(st.st_mode)) return;
+    std::string data;
+    char buf[65536];
+    for (;;) {
+        const ssize_t n = ::read(STDIN_FILENO, buf, sizeof buf);
+        if (n <= 0) break;
+        data.append(buf, static_cast<std::size_t>(n));
+    }
+    g_stdin_data = std::move(data);
+    g_stdin_loaded = true;
+}
+
+static void run_native(const LibraryHandle &lib) {
+    if (g_stdin_loaded && lib.set_input) {
+        lib.set_input(reinterpret_cast<const unsigned char *>(g_stdin_data.data()), g_stdin_data.size());
+    }
+    const TapeMap tape = alloc_tape();
+    if (!call_guarded(lib.fn, tape.base)) {
         if (lib.flush) lib.flush();
-        ::munmap(region, total);
+        ::munmap(tape.region, tape.total);
         throw std::runtime_error{"Pointer out of bounds"};
     }
-    ::munmap(region, total);
+    ::munmap(tape.region, tape.total);
+}
+
+// ---------------------------------------------------------------------------
+// Tier 0: an in-process interpreter of the optimized IR. Used while the native build is not ready yet.
+// ---------------------------------------------------------------------------
+struct InterpState {
+    const std::vector<Ir> *code{nullptr};
+    const std::string *input{nullptr};
+    std::size_t in_pos{0};
+    std::string out;
+    bool committed{false}; // output already left the process: the run can no longer be restarted natively
+    bool aborted{false};
+
+    bool (*poll)(void *){nullptr};
+
+    void *poll_ctx{nullptr};
+};
+
+static InterpState *g_interp = nullptr;
+
+static void interp_write(const std::string &data) {
+    std::size_t off = 0;
+    while (off < data.size()) {
+        const ssize_t n = ::write(STDOUT_FILENO, data.data() + off, data.size() - off);
+        if (n <= 0) break;
+        off += static_cast<std::size_t>(n);
+    }
+}
+
+static void interp_entry(unsigned char *base) {
+    InterpState &s = *g_interp;
+    const Ir *const code = s.code->data();
+    unsigned char *p = base;
+    std::size_t pc = 0;
+    std::uint32_t budget = 1U << 20;
+
+    // Called on every backward edge; every ~1M of them asks whether the native build became ready.
+    const auto tick = [&s, &budget]() -> bool {
+        if (--budget != 0) return false;
+        budget = 1U << 20;
+        if (!s.committed && s.poll != nullptr && s.poll(s.poll_ctx)) {
+            s.aborted = true;
+            return true;
+        }
+        return false;
+    };
+
+    for (;;) {
+        const Ir &in = code[pc];
+        switch (in.op) {
+            case Op::Add:
+                p[in.off] = static_cast<unsigned char>(p[in.off] + in.arg);
+                ++pc;
+                break;
+            case Op::Set:
+                p[in.off] = static_cast<unsigned char>(in.arg);
+                ++pc;
+                break;
+            case Op::Move:
+                p += in.arg;
+                ++pc;
+                break;
+            case Op::Out:
+                s.out.push_back(static_cast<char>(p[in.off]));
+                ++pc;
+                if (s.committed) {
+                    if (s.out.size() >= 65536) {
+                        interp_write(s.out);
+                        s.out.clear();
+                    }
+                } else if (s.out.size() >= (4U << 20)) {
+                    interp_write(s.out);
+                    s.out.clear();
+                    s.committed = true;
+                }
+                break;
+            case Op::In:
+                if (s.in_pos < s.input->size()) {
+                    p[in.off] = static_cast<unsigned char>((*s.input)[s.in_pos++]);
+                } else {
+                    p[in.off] = 0;
+                }
+                ++pc;
+                break;
+            case Op::JumpIfZero:
+            case Op::IfNonZero:
+                pc = p[in.off] == 0 ? static_cast<std::size_t>(in.arg) + 1 : pc + 1;
+                break;
+            case Op::EndIf:
+                ++pc;
+                break;
+            case Op::JumpIfNotZero:
+                if (p[in.off] != 0) {
+                    pc = static_cast<std::size_t>(in.arg) + 1;
+                    if (tick()) return;
+                } else {
+                    ++pc;
+                }
+                break;
+            case Op::MoveJnz:
+                p += in.off2;
+                if (p[in.off] != 0) {
+                    pc = static_cast<std::size_t>(in.arg) + 1;
+                    if (tick()) return;
+                } else {
+                    ++pc;
+                }
+                break;
+            case Op::MulAdd:
+                p[in.off2] = static_cast<unsigned char>(p[in.off2] + static_cast<unsigned>(in.arg) * p[in.off]);
+                ++pc;
+                break;
+            case Op::MulAddClear:
+                p[in.off2] = static_cast<unsigned char>(p[in.off2] + static_cast<unsigned>(in.arg) * p[in.off]);
+                p[in.off] = 0;
+                ++pc;
+                break;
+            case Op::MulCells:
+                p[in.off2] = static_cast<unsigned char>(p[in.off2] +
+                                                        static_cast<unsigned>(in.arg) * p[in.off] * p[in.off3]);
+                ++pc;
+                break;
+            case Op::Scan:
+                while (*p != 0) {
+                    p += in.arg;
+                    if (tick()) return;
+                }
+                ++pc;
+                break;
+            case Op::Halt:
+                return;
+        }
+    }
+}
+
+// Returns true when the program ran to completion (its output is written), false when it was aborted so that the
+// native build can run the program from scratch (nothing has been written in that case).
+static bool run_interp(const ProgramIr &prog, const std::string &input, bool (*poll)(void *), void *poll_ctx) {
+    InterpState state;
+    state.code = &prog.code;
+    state.input = &input;
+    state.out = prog.pre_output;
+    state.poll = poll;
+    state.poll_ctx = poll_ctx;
+    g_interp = &state;
+
+    const TapeMap tape = alloc_tape();
+    const bool ok = call_guarded(interp_entry, tape.base);
+    ::munmap(tape.region, tape.total);
+    if (!ok) {
+        interp_write(state.out);
+        throw std::runtime_error{"Pointer out of bounds"};
+    }
+    if (state.aborted) return false;
+    interp_write(state.out);
+    return true;
+}
+
+struct Race {
+    pid_t pid{-1};
+    bool ready{false};
+    bool failed{false};
+};
+
+static bool race_poll(void *ctx) {
+    auto &r = *static_cast<Race *>(ctx);
+    if (r.ready || r.failed || r.pid <= 0) return r.ready;
+    int st = 0;
+    if (::waitpid(r.pid, &st, WNOHANG) == r.pid) {
+        r.pid = -1;
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 0) r.ready = true;
+        else r.failed = true;
+    }
+    return r.ready;
+}
+
+static pid_t spawn_compile(const BuildPlan &plan) {
+    const std::string tmp = shell_quote(plan.tmp.string());
+    const std::string cmd = "if " + plan.cmd + "; then mv -f " + tmp + " " + shell_quote(plan.lib) +
+                            "; s=$?; else s=1; fi; rm -f " + shell_quote(plan.src.string()) + " " + tmp + "; exit $s";
+    const pid_t pid = ::fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        ::setpgid(0, 0);
+        const int dn = ::open("/dev/null", O_RDWR);
+        if (dn >= 0) {
+            ::dup2(dn, 0);
+            ::dup2(dn, 1);
+            ::dup2(dn, 2);
+        }
+        ::execl("/bin/sh", "sh", "-c", cmd.c_str(), static_cast<char *>(nullptr));
+        ::_exit(127);
+    }
+    ::setpgid(pid, pid);
+    return pid;
+}
+
+// Runs the program. Cache hit: native immediately. Cache miss: interpret right away while the native build runs in
+// the background; whichever finishes first wins (a finished build restarts the program natively from scratch).
+static void run_tiered(const std::string &program, const bool no_cache) {
+    const bool has_input = program.find(',') != std::string::npos;
+    if (has_input) preload_stdin_if_regular();
+
+    const bool eligible = std::getenv("BF_NO_TIER") == nullptr && (!has_input || g_stdin_loaded);
+    const BuildPlan probe = plan_build(program, no_cache, {}, {}, nullptr, false);
+    if (probe.cached || !eligible) {
+        const LibraryHandle lib{build_library(program, no_cache)};
+        run_native(lib);
+        return;
+    }
+
+    const ProgramIr prog = convert(program);
+    const BuildPlan plan = plan_build(program, no_cache, {}, {}, &prog, true);
+    Race race;
+    race.pid = spawn_compile(plan);
+    if (race.pid < 0) {
+        const LibraryHandle lib{build_library(program, no_cache)};
+        run_native(lib);
+        return;
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    static const std::string no_input;
+    const bool finished = run_interp(prog, g_stdin_loaded ? g_stdin_data : no_input, race_poll, &race);
+    if (!finished) {
+        const LibraryHandle lib{plan.lib};
+        run_native(lib);
+        return;
+    }
+    if (race.pid > 0) {
+        const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (secs < 0.25) {
+            // Short program: the build is not needed, drop it. A long-running one lets the build finish
+            // (detached) so that the next run starts natively.
+            ::kill(-race.pid, SIGKILL);
+            ::waitpid(race.pid, nullptr, 0);
+            std::error_code ec;
+            fs::remove(plan.src, ec);
+            fs::remove(plan.tmp, ec);
+        }
+    }
 }
 
 // llvm-profdata must match the compiler's raw profile version, so prefer the one sitting next to the compiler.
@@ -2002,8 +2308,7 @@ int main(const int argc, char **argv) {
             std::fflush(nullptr);
             ::_exit(0);
         }
-        const LibraryHandle lib{build_library(program, no_cache)};
-        run_native(lib);
+        run_tiered(program, no_cache);
         std::fflush(nullptr);
         ::_exit(0);
     } catch (const std::exception &e) {
